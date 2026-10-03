@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Погода на планете: 15 городов России</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:#eaf2ff}
+  #c{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hint{position:fixed;top:14px;left:16px;font-size:13px;opacity:.6;pointer-events:none}
+  #progress{position:fixed;top:0;left:0;height:3px;width:0;background:#5ab0ff}
+  #card{position:fixed;left:50%;bottom:6vh;transform:translateX(-50%);
+    min-width:280px;max-width:90vw;padding:18px 22px;border-radius:16px;
+    background:rgba(10,20,40,.72);border:1px solid rgba(120,180,255,.35);
+    backdrop-filter:blur(8px);box-shadow:0 10px 40px rgba(0,0,0,.5);
+    opacity:0;pointer-events:none;transition:opacity .5s}
+  #card.show{opacity:1}
+  #city{font-size:22px;font-weight:600}
+  #temp{font-size:56px;font-weight:300;line-height:1.1}
+  #desc{opacity:.8;margin-bottom:10px}
+  #grid{display:grid;grid-template-columns:1fr 1fr;gap:6px 18px;font-size:14px}
+  #grid span.k{opacity:.6;margin-right:6px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">Погода в 15 городах России · данные MET Norway</div>
+<div id="progress"></div>
+<div id="card">
+  <div id="city"></div>
+  <div id="temp"></div>
+  <div id="desc"></div>
+  <div id="grid"></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ---------- Данные ----------
+const CITIES = [
+  { name: "Москва",           lat: 55.7558, lon: 37.6173 },
+  { name: "Санкт-Петербург",  lat: 59.9343, lon: 30.3351 },
+  { name: "Новосибирск",      lat: 55.0084, lon: 82.9357 },
+  { name: "Екатеринбург",     lat: 56.8389, lon: 60.6057 },
+  { name: "Казань",           lat: 55.7887, lon: 49.1221 },
+  { name: "Нижний Новгород",  lat: 56.2965, lon: 43.9361 },
+  { name: "Челябинск",        lat: 55.1644, lon: 61.4368 },
+  { name: "Самара",           lat: 53.1959, lon: 50.1008 },
+  { name: "Омск",             lat: 54.9885, lon: 73.3242 },
+  { name: "Ростов-на-Дону",   lat: 47.2357, lon: 39.7015 },
+  { name: "Уфа",              lat: 54.7388, lon: 55.9721 },
+  { name: "Красноярск",       lat: 56.0153, lon: 92.8932 },
+  { name: "Воронеж",          lat: 51.6720, lon: 39.1843 },
+  { name: "Пермь",            lat: 58.0105, lon: 56.2502 },
+  { name: "Владивосток",      lat: 43.1155, lon: 131.8855 }
+];
+
+const SLOT_MS = 10000;                 // сколько показывается каждый город
+const TOTAL_MS = SLOT_MS * CITIES.length;
+const R = 1.6;                         // радиус планеты
+const EARTH_TEX = "https://cdn.jsdelivr.net/npm/three-globe@2.31.0/example/img/earth-blue-marble.jpg";
+
+let weather = [];                      // данные по городам (по индексу), null если не загрузились
+
+// ---------- Погода: символы MET Norway ----------
+const SYMBOLS = {
+  clearsky: "Ясно", fair: "Преимущественно ясно", partlycloudy: "Переменная облачность",
+  cloudy: "Пасмурно", fog: "Туман", lightrain: "Слабый дождь", rain: "Дождь",
+  heavyrain: "Сильный дождь", lightrainshowers: "Кратковременный дождь",
+  rainshowers: "Ливень", heavyrainshowers: "Сильный ливень",
+  lightsleet: "Мокрый снег", sleet: "Мокрый снег", heavysleet: "Мокрый снег",
+  lightsnow: "Слабый снег", snow: "Снег", heavysnow: "Сильный снег", snowshowers: "Снегопад"
+};
+function symbolRu(code) {
+  if (!code) return "—";
+  const base = code.replace(/_(day|night|polartwilight)$/, "");
+  if (base.includes("thunder")) return "Гроза";
+  return SYMBOLS[base] ?? "—";
+}
+
+const DIRS = ["С", "СВ", "В", "ЮВ", "Ю", "ЮЗ", "З", "СЗ"];
+const dirName = deg => DIRS[Math.round(deg / 45) % 8];
+
+// Координаты -> точка на сфере (совпадает с UV-раскладкой SphereGeometry)
+function ll2v(lat, lon, r) {
+  const la = lat * Math.PI / 180, lo = lon * Math.PI / 180;
+  return new THREE.Vector3(r * Math.cos(la) * Math.cos(lo),
+                           r * Math.sin(la),
+                           -r * Math.cos(la) * Math.sin(lo));
+}
+
+// ---------- Сцена ----------
+const canvas = document.getElementById("c");
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 200);
+let distCur = 9, distTarget = 3.6;     // в начале камера приближается к планете
+camera.position.set(0, 0, distCur);
+
+scene.add(new THREE.AmbientLight(0x404060, 1.2));
+const sun = new THREE.DirectionalLight(0xffffff, 1.5);
+sun.position.set(5, 3, 5);
+scene.add(sun);
+
+// Звёзды
+{
+  const g = new THREE.BufferGeometry();
+  const pos = new Float32Array(1500 * 3);
+  for (let i = 0; i < 1500; i++) {
+    const u = Math.random() * 2 - 1, th = Math.random() * Math.PI * 2, s = Math.sqrt(1 - u * u);
+    const r = 60 + Math.random() * 40;
+    pos.set([r * s * Math.cos(th), r * u, r * s * Math.sin(th)], i * 3);
+  }
+  g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  scene.add(new THREE.Points(g, new THREE.PointsMaterial({ color: 0xffffff, size: 0.15 })));
+}
+
+// Планета
+const planet = new THREE.Group();
+scene.add(planet);
+
+const globe = new THREE.Mesh(
+  new THREE.SphereGeometry(R, 64, 64),
+  new THREE.MeshPhongMaterial({ color: 0x2a6fb0, shininess: 12 })   // запасной цвет
+);
+planet.add(globe);
+new THREE.TextureLoader().load(EARTH_TEX, tex => {
+  globe.material.map = tex;
+  globe.material.color.set(0xffffff);
+  globe.material.needsUpdate = true;
+});
+
+// Атмосфера
+const atmo = new THREE.Mesh(
+  new THREE.SphereGeometry(R * 1.05, 64, 64),
+  new THREE.MeshBasicMaterial({ color: 0x4aa8ff, transparent: true, opacity: 0.12,
+    side: THREE.BackSide, blending: THREE.AdditiveBlending })
+);
+scene.add(atmo);
+
+// Маркеры городов
+const markers = CITIES.map(c => {
+  const m = new THREE.Mesh(new THREE.SphereGeometry(0.035, 16, 16),
+                           new THREE.MeshBasicMaterial({ color: 0xffcc33 }));
+  m.position.copy(ll2v(c.lat, c.lon, R * 1.01));
+  planet.add(m);
+  return m;
+});
+
+// ---------- Карточка ----------
+const $ = id => document.getElementById(id);
+const card = $("card");
+
+function fillCity(i) {
+  const c = CITIES[i], w = weather[i];
+  $("city").textContent = `${i + 1}/${CITIES.length}  ${c.name}`;
+  if (!w) {
+    $("temp").textContent = "";
+    $("desc").textContent = weather.length ? "Нет данных" : "Загрузка данных…";
+    $("grid").innerHTML = "";
+    return;
+  }
+  $("temp").textContent = `${Math.round(w.t)}°C`;
+  $("desc").textContent = w.desc;
+  const rows = [
+    ["Ветер", `${w.wind.toFixed(1)} м/с, ${dirName(w.windDir)}`],
+    ["Влажность", `${Math.round(w.hum)}%`],
+    ["Давление", `${Math.round(w.press)} гПа`],
+    ["Осадки", `${w.precip} мм`],
+    ["Облачность", `${Math.round(w.cloud)}%`]
+  ];
+  $("grid").innerHTML = rows.map(([k, v]) => `<div><span class="k">${k}</span>${v}</div>`).join("");
+}
+
+let targetQ = new THREE.Quaternion();
+function focusCity(i) {
+  const c = CITIES[i];
+  const v = ll2v(c.lat, c.lon, 1).normalize();
+  targetQ.setFromUnitVectors(v, new THREE.Vector3(0, 0, 1)); // повернуть город к камере
+}
+
+function showCity(i) {
+  focusCity(i);
+  fillCity(i);
+  card.classList.add("show");
+  distTarget = 3.6;
+}
+
+function showOverview() {
+  card.classList.add("show");
+  $("city").textContent = "Итоги: все 15 городов";
+  $("temp").textContent = "";
+  $("desc").textContent = "Обзор температур";
+  $("grid").innerHTML = CITIES.map((c, i) => {
+    const t = weather[i] ? `${Math.round(weather[i].t)}°C` : "—";
+    return `<div><span class="k">${c.name}</span>${t}</div>`;
+  }).join("");
+}
+
+// ---------- Загрузка погоды (MET Norway, без ключа) ----------
+async function fetchCity(c) {
+  const url = `https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=${c.lat}&lon=${c.lon}`;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 10000);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const j = await res.json();
+    const ts = j.properties.timeseries[0];
+    const d = ts.data.instant.details;
+    const n1 = ts.data.next_1_hours;
+    return {
+      t: d.air_temperature,
+      wind: d.wind_speed,
+      windDir: d.wind_from_direction,
+      hum: d.relative_humidity,
+      press: d.air_pressure_at_sea_level,
+      cloud: d.cloud_area_fraction,
+      precip: n1?.details?.precipitation_amount ?? 0,
+      desc: symbolRu(n1?.summary?.symbol_code)
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function loadWeather() {
+  // Каждый город грузится отдельно: если один упал, остальные всё равно покажутся
+  weather = await Promise.all(CITIES.map(c =>
+    fetchCity(c).catch(e => { console.error(c.name, e); return null; })
+  ));
+  if (weather.every(w => w === null)) {
+    $("desc").textContent = "Погода временно недоступна. Проверьте сеть.";
+  }
+}
+
+// ---------- Таймлайн ----------
+// Всё привязано к моменту загрузки страницы: при каждом обновлении показ начинается с Москвы
+const t0 = performance.now();
+let lastIdx = -1, finished = false, overviewShown = false;
+
+function loop(now) {
+  const t = now - t0;
+  const dt = 1 / 60;
+  const k = 1 - Math.exp(-dt * 3);
+
+  if (t < TOTAL_MS) {
+    const idx = Math.floor(t / SLOT_MS);
+    if (idx !== lastIdx) {
+      lastIdx = idx;
+      showCity(idx);
+    }
+  } else if (!finished) {
+    finished = true;
+    lastIdx = -1;
+    card.classList.remove("show");
+    setTimeout(() => {
+      distTarget = 13;                 // камера отдаляется от планеты
+      showOverview();
+      overviewShown = true;
+    }, 1200);
+  }
+
+  // Плавное вращение планеты к текущему городу и зум камеры
+  planet.quaternion.slerp(targetQ, k);
+  distCur += (distTarget - distCur) * k;
+  camera.position.set(0, 0, distCur);
+  camera.lookAt(0, 0, 0);
+
+  // Подсветка текущего города и прогресс-бар
+  markers.forEach((m, i) => m.scale.setScalar(i === lastIdx ? 2.4 : 1));
+  $("progress").style.width = Math.min(t / TOTAL_MS, 1) * 100 + "%";
+
+  atmo.quaternion.copy(planet.quaternion);
+  renderer.render(scene, camera);
+  requestAnimationFrame(loop);
+}
+
+window.addEventListener("resize", () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// Старт: анимация запускается сразу, погода подгружается параллельно
+loadWeather().then(() => {
+  if (lastIdx >= 0 && lastIdx < CITIES.length) fillCity(lastIdx);
+  if (overviewShown) showOverview();
+});
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
